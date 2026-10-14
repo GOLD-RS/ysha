@@ -23,7 +23,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
 APP_DIR = Path(os.environ.get("YSHA_HOME", Path.home() / ".ysha")).expanduser()
 WORKSPACE = (APP_DIR / "arquivos").resolve()
 CONFIG_PATH = APP_DIR / "config.json"
@@ -491,7 +490,7 @@ def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
     cfg, state = load_config(), load_state()
-    print(f"Ysha {VERSION} — pasta de trabalho: {WORKSPACE}")
+    print(f"Ysha — assistente pessoal | arquivos: {WORKSPACE}")
     print("Digite /ajuda para ver comandos, /sair para encerrar. Seus dados ficam no aparelho.")
     for msg in check_reminders(state):
         print("\n🔔 " + msg)
