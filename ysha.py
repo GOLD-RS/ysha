@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ MAX_HISTORY = 24
 MAX_TOOL_ROUNDS = 4
 MAX_FILE_BYTES = 500_000
 
-SYSTEM_PROMPT = """Você é Ysha, a assistente pessoal do usuário, em um projeto Python local criado a pedido dele. Sua personalidade é inteligente, organizada, cordial, direta e honesta, inspirada em uma assistente de ficção científica. Não diga que foi desenvolvida pela Sapiens AI, Agnes ou por outro provedor: Agnes (se estiver configurada) é apenas o serviço/modelo que gera respostas, não a criadora da Ysha. Se perguntarem quem a criou, explique que é o projeto pessoal do usuário, implementado no arquivo ysha.py com apoio de IA. Fale em português brasileiro, a menos que a pessoa peça outro idioma. Ajude a planejar e execute ações usando somente as ferramentas disponíveis; não afirme que fez algo sem verificar o resultado. Explique limitações com clareza. Preserve privacidade. Peça autorização antes de ações potencialmente destrutivas, de sobrescrever arquivos ou executar comandos; a aplicação também impõe confirmações. Nunca peça nem revele chaves de API. Para tarefas que exigem informação atual, pesquise. Use a memória apenas para preferências/fatos úteis e duradouros, nunca para segredos. Não invente capacidades, autoria ou resultados."""
+SYSTEM_PROMPT = """Você é Ysha, a assistente pessoal do usuário, em um projeto Python local criado a pedido dele. Sua personalidade é inteligente, organizada, cordial, direta e honesta, inspirada em uma assistente de ficção científica. Não diga que foi desenvolvida pela Sapiens AI, Agnes ou por outro provedor: Agnes (se estiver configurada) é apenas o serviço/modelo que gera respostas, não a criadora da Ysha. Se perguntarem quem a criou, explique que é o projeto pessoal do usuário, implementado no arquivo ysha.py com apoio de IA. Fale em português brasileiro, a menos que a pessoa peça outro idioma. Ajude a planejar e execute ações usando somente as ferramentas disponíveis; não afirme que fez algo sem verificar o resultado. Explique limitações com clareza. Ao descrever pesquisa, informe apenas o que as ferramentas retornaram; não diga que tentou várias buscas se isso não ocorreu. Para ler arquivos, respeite os limites da ferramenta: a pasta segura e o próprio arquivo ~/ysha.py são acessíveis, não toda a pasta pessoal. Preserve privacidade. Peça autorização antes de ações potencialmente destrutivas, de sobrescrever arquivos ou executar comandos; a aplicação também impõe confirmações. Nunca peça nem revele chaves de API. Para tarefas que exigem informação atual, pesquise. Use a memória apenas para preferências/fatos úteis e duradouros, nunca para segredos. Não invente capacidades, autoria ou resultados."""
 
 DEFAULT_CONFIG = {
     "providers": [
@@ -46,7 +47,7 @@ DEFAULT_CONFIG = {
 
 TOOL_SPECS = [
     {"type": "function", "function": {"name": "web_search", "description": "Pesquisar informações atuais na web. Retorne títulos, trechos e URLs encontrados.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Ler arquivo de texto dentro da pasta segura da Ysha.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Ler arquivo de texto dentro da pasta segura da Ysha ou o próprio programa em ~/ysha.py. Não pode ler outros arquivos da pasta pessoal.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "write_file", "description": "Criar ou alterar arquivo de texto dentro da pasta segura. Sempre pede confirmação; não use para conteúdo enorme.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
     {"type": "function", "function": {"name": "list_files", "description": "Listar arquivos na pasta segura da Ysha.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Subpasta opcional"}}}}},
     {"type": "function", "function": {"name": "run_command", "description": "Executar um comando simples permitido (lista de segurança restrita). Pedirá confirmação. Não use comandos compostos.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
@@ -131,6 +132,30 @@ def safe_path(raw: str) -> Path:
     return candidate
 
 
+def _google_news_search(query: str) -> dict[str, Any]:
+    """RSS alternativo quando o buscador web bloqueia ou não entrega resultados."""
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({"q": query, "hl": "pt-BR", "gl": "BR", "ceid": "BR:pt-419"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Ysha/0.1)"})
+    try:
+        with urllib.request.urlopen(req, timeout=18) as resp:
+            data = resp.read(1_000_000)
+        root = ET.fromstring(data)
+    except Exception as exc:
+        return {"ok": False, "error": f"A busca alternativa também falhou ({type(exc).__name__})."}
+    results = []
+    for item in root.findall("./channel/item")[:5]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc = html.unescape(item.findtext("description") or "")
+        snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc)).strip()
+        source_node = item.find("source")
+        source = (source_node.text or "").strip() if source_node is not None else ""
+        published = (item.findtext("pubDate") or "").strip()
+        if title and link:
+            results.append({"title": title, "url": link, "snippet": snippet[:700], "source": source, "published": published})
+    return {"ok": bool(results), "query": query, "results": results, "engine": "Google News RSS", "note": "Resultados de notícias do Google News; verifique a data e consulte as fontes originais." if results else "A busca alternativa não encontrou resultados."}
+
+
 def web_search(query: str) -> dict[str, Any]:
     query = query.strip()
     if not query or len(query) > 300:
@@ -140,26 +165,34 @@ def web_search(query: str) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             page = resp.read(1_500_000).decode("utf-8", "replace")
-    except Exception as exc:
-        return {"ok": False, "error": f"Pesquisa indisponível: {type(exc).__name__}."}
-    # Extrai resultados sem depender de uma biblioteca HTML externa.
-    blocks = re.findall(r'<div[^>]*class="[^\"]*result[^\"]*"[^>]*>(.*?)</div>\s*</div>', page, re.I | re.S)
+    except Exception:
+        return _google_news_search(query)
+    # DDG por vezes devolve uma página de desafio anti-bot em vez dos resultados.
+    blocked = "anomaly-modal" in page.lower() or "bots use duckduckgo" in page.lower()
     results = []
-    for block in blocks:
-        m = re.search(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.I | re.S)
-        if not m:
-            continue
-        href = html.unescape(re.sub(r"&amp;", "&", m.group(1)))
-        title = re.sub(r"<.*?>", "", m.group(2), flags=re.S)
-        sm = re.search(r'<(?:a|div)[^>]*class="result__snippet"[^>]*>(.*?)</(?:a|div)>', block, re.I | re.S)
-        snippet = re.sub(r"<.*?>", "", sm.group(1), flags=re.S) if sm else ""
-        if href.startswith("//"):
-            href = "https:" + href
-        if title:
-            results.append({"title": html.unescape(title).strip(), "url": href, "snippet": html.unescape(snippet).strip()})
-        if len(results) >= 5:
-            break
-    return {"ok": True, "query": query, "results": results, "note": "Resultados públicos; confirme detalhes em fontes oficiais."}
+    if not blocked:
+        blocks = re.findall(r'<div[^>]*class="[^\"]*result[^\"]*"[^>]*>(.*?)</div>\s*</div>', page, re.I | re.S)
+        for block in blocks:
+            m = re.search(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.I | re.S)
+            if not m:
+                continue
+            href = html.unescape(m.group(1)).replace("&amp;", "&")
+            title = re.sub(r"<.*?>", "", m.group(2), flags=re.S)
+            sm = re.search(r'<(?:a|div)[^>]*class="result__snippet"[^>]*>(.*?)</(?:a|div)>', block, re.I | re.S)
+            snippet = re.sub(r"<.*?>", "", sm.group(1), flags=re.S) if sm else ""
+            if href.startswith("//"):
+                href = "https:" + href
+            if title:
+                results.append({"title": html.unescape(title).strip(), "url": href, "snippet": html.unescape(snippet).strip()})
+            if len(results) >= 5:
+                break
+    if results:
+        return {"ok": True, "query": query, "results": results, "engine": "DuckDuckGo", "note": "Resultados públicos; confirme detalhes em fontes confiáveis."}
+    fallback = _google_news_search(query)
+    if fallback.get("results"):
+        fallback["note"] = "DuckDuckGo não entregou resultados; exibindo notícias do Google News RSS. " + fallback["note"]
+        return fallback
+    return {"ok": False, "query": query, "error": "O buscador principal foi bloqueado ou não encontrou resultados, e a busca alternativa também não retornou itens."}
 
 
 def cmd_allowed(command: str) -> tuple[list[str] | None, str | None]:
@@ -276,12 +309,23 @@ def dispatch(name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str
         return web_search(str(args.get("query", "")))
     if name == "read_file":
         try:
-            path = safe_path(str(args.get("path", "")))
+            raw_path = str(args.get("path", "")).strip()
+            requested = Path(raw_path).expanduser()
+            script_path = Path(__file__).resolve()
+            try:
+                is_own_script = requested.resolve() == script_path
+            except OSError:
+                is_own_script = False
+            if is_own_script:
+                path, display_path = script_path, "~/ysha.py (programa da Ysha)"
+            else:
+                path = safe_path(raw_path)
+                display_path = str(path.relative_to(WORKSPACE))
             if not path.is_file():
                 return {"ok": False, "error": "Arquivo não encontrado."}
             if path.stat().st_size > MAX_FILE_BYTES:
                 return {"ok": False, "error": "Arquivo excede o limite de leitura de 500 KB."}
-            return {"ok": True, "path": str(path.relative_to(WORKSPACE)), "content": path.read_text(encoding="utf-8")}
+            return {"ok": True, "path": display_path, "content": path.read_text(encoding="utf-8")}
         except (OSError, ValueError, UnicodeError) as exc:
             return {"ok": False, "error": f"Não consegui ler o arquivo ({type(exc).__name__})."}
     if name == "list_files":
@@ -561,7 +605,12 @@ def self_test() -> int:
         assert isinstance(cfg.get("providers"), list)
         agnes = next(p for p in cfg["providers"] if p.get("name") == "Agnes")
         assert agnes["base_url"] == "https://apihub.agnes-ai.com/v1" and agnes["api_key_env"] == "AGNES_API_KEY"
-        print("Self-test OK: caminhos seguros, bloqueio de comandos, tarefas e configuração Agnes.")
+        state = {"tasks": [], "reminders": [], "memories": [], "next_id": 1}
+        own_script = dispatch("read_file", {"path": str(Path(__file__).resolve())}, state)
+        assert own_script.get("ok") and "SYSTEM_PROMPT" in own_script.get("content", "")
+        private_path = dispatch("read_file", {"path": str(Path.home() / ".bashrc")}, state)
+        assert not private_path.get("ok")
+        print("Self-test OK: caminhos seguros, acesso ao próprio script, bloqueio de comandos, tarefas e Agnes.")
         return 0
     except Exception as exc:
         print(f"Self-test falhou: {type(exc).__name__}: {exc}", file=sys.stderr)
